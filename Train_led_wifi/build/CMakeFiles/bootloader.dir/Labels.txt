@@ -1,0 +1,13 @@
+# Target labels
+ bootloader
+# Source files and their labels
+/home/mambo/Project/Arm_Mcu_Projects/Esp32/Train_led_wifi/build/CMakeFiles/bootloader
+/home/mambo/Project/Arm_Mcu_Projects/Esp32/Train_led_wifi/build/CMakeFiles/bootloader.rule
+/home/mambo/Project/Arm_Mcu_Projects/Esp32/Train_led_wifi/build/CMakeFiles/bootloader-complete.rule
+/home/mambo/Project/Arm_Mcu_Projects/Esp32/Train_led_wifi/build/bootloader-prefix/src/bootloader-stamp/bootloader-build.rule
+/home/mambo/Project/Arm_Mcu_Projects/Esp32/Train_led_wifi/build/bootloader-prefix/src/bootloader-stamp/bootloader-configure.rule
+/home/mambo/Project/Arm_Mcu_Projects/Esp32/Train_led_wifi/build/bootloader-prefix/src/bootloader-stamp/bootloader-download.rule
+/home/mambo/Project/Arm_Mcu_Projects/Esp32/Train_led_wifi/build/bootloader-prefix/src/bootloader-stamp/bootloader-install.rule
+/home/mambo/Project/Arm_Mcu_Projects/Esp32/Train_led_wifi/build/bootloader-prefix/src/bootloader-stamp/bootloader-mkdir.rule
+/home/mambo/Project/Arm_Mcu_Projects/Esp32/Train_led_wifi/build/bootloader-prefix/src/bootloader-stamp/bootloader-patch.rule
+/home/mambo/Project/Arm_Mcu_Projects/Esp32/Train_led_wifi/build/bootloader-prefix/src/bootloader-stamp/bootloader-update.rule

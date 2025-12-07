@@ -1,0 +1,278 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ESP32 全彩点阵画板</title>
+    <style>
+        :root { --bg-color: #1a1a1a; --panel-color: #2d2d2d; --text-color: #e0e0e0; --accent-color: #4CAF50; }
+        body { font-family: 'Segoe UI', sans-serif; background-color: var(--bg-color); color: var(--text-color); display: flex; flex-direction: column; align-items: center; min-height: 100vh; margin: 0; padding: 20px; }
+        h1 { margin-bottom: 20px; font-weight: 300; letter-spacing: 2px; }
+        
+        /* 布局容器 */
+        .container { display: flex; gap: 40px; flex-wrap: wrap; justify-content: center; }
+        .control-panel { background: var(--panel-color); padding: 20px; border-radius: 12px; box-shadow: 0 4px 15px rgba(0,0,0,0.3); width: 300px; }
+        
+        /* 画板网格 */
+        .grid-container { background: var(--panel-color); padding: 20px; border-radius: 12px; box-shadow: 0 4px 15px rgba(0,0,0,0.3); }
+        .grid { display: grid; grid-template-columns: repeat(8, 40px); grid-gap: 4px; }
+        .cell { 
+            width: 40px; height: 40px; 
+            background: #000; 
+            border-radius: 4px; 
+            border: 1px solid #444; 
+            cursor: pointer; 
+            transition: transform 0.1s;
+        }
+        .cell:hover { border-color: #888; transform: scale(1.05); }
+
+        /* 控件样式 */
+        .input-group { margin-bottom: 15px; }
+        label { display: block; margin-bottom: 5px; font-size: 0.9em; color: #aaa; }
+        input[type="text"] { width: 100%; padding: 8px; border-radius: 4px; border: 1px solid #555; background: #333; color: white; box-sizing: border-box;}
+        input[type="color"] { width: 100%; height: 40px; border: none; cursor: pointer; background: none; }
+        input[type="range"] { width: 100%; cursor: pointer; } 
+
+        button { 
+            width: 100%; padding: 10px; margin-top: 10px; border: none; border-radius: 6px; 
+            font-weight: bold; cursor: pointer; transition: opacity 0.2s; 
+        }
+        button:hover { opacity: 0.9; }
+        .btn-send { background: var(--accent-color); color: white; font-size: 1.1em; }
+        .btn-clear { background: #f44336; color: white; }
+        .btn-save { background: #2196F3; color: white; }
+        .btn-delete { background: #ff9800; color: white; font-size: 0.8em; padding: 5px; margin-top: 0; width: auto;}
+
+        /* 保存列表 */
+        .saved-list { list-style: none; padding: 0; margin-top: 10px; max-height: 200px; overflow-y: auto; }
+        .saved-item { 
+            display: flex; justify-content: space-between; align-items: center; 
+            background: #333; padding: 8px; margin-bottom: 5px; border-radius: 4px; font-size: 0.9em;
+        }
+        .saved-item span { cursor: pointer; flex-grow: 1; }
+        .saved-item span:hover { color: var(--accent-color); }
+
+        /* 状态提示 */
+        #status { margin-top: 10px; text-align: center; font-size: 0.9em; min-height: 1.2em; }
+    </style>
+</head>
+<body>
+    <h1>ESP32 PIXEL ART</h1>
+
+    <div class="container">
+        <div class="control-panel">
+            <div class="input-group">
+                <label>ESP32 IP 地址:</label>
+                <input type="text" id="esp-ip" value="192.168.31.xxx" placeholder="输入 IP">
+            </div>
+            
+            <div class="input-group">
+                <label>当前画笔颜色:</label>
+                <input type="color" id="color-picker" value="#ff0000">
+            </div>
+
+            <div class="input-group">
+                <label style="display:flex; justify-content:space-between;">
+                    全局亮度: <span id="bri-val" style="color:var(--accent-color)">20%</span>
+                </label>
+                <input type="range" id="brightness" min="1" max="100" value="20">
+            </div>
+
+            <button class="btn-send" onclick="sendData()">📡 发送图案</button>
+            <button class="btn-clear" onclick="clearGrid()">🗑️ 清空画板</button>
+            <div id="status"></div>
+
+            <hr style="border-color: #444; margin: 20px 0;">
+
+            <div class="input-group">
+                <label>保存当前作品:</label>
+                <div style="display: flex; gap: 5px;">
+                    <input type="text" id="pattern-name" placeholder="图案名称">
+                    <button class="btn-save" style="width: 80px; margin-top: 0;" onclick="savePattern()">保存</button>
+                </div>
+            </div>
+
+            <label>已保存的图案 (点击加载):</label>
+            <ul class="saved-list" id="saved-list">
+                </ul>
+        </div>
+
+        <div class="grid-container">
+            <div class="grid" id="matrix"></div>
+            <div style="margin-top:10px; color:#666; font-size: 0.8em; text-align: center;">
+                🖱️ 左键绘画 / 拖拽 | 🖱️ 右键擦除
+            </div>
+        </div>
+    </div>
+
+    <script>
+        const matrixDiv = document.getElementById('matrix');
+        const colorPicker = document.getElementById('color-picker');
+        const statusDiv = document.getElementById('status');
+        
+        // --- 新增：获取亮度相关的 DOM 元素 ---
+        const brightnessSlider = document.getElementById('brightness');
+        const briValSpan = document.getElementById('bri-val');
+
+        // 存储 64 个 LED 的颜色值
+        let pixels = new Array(64).fill(0);
+        let isDrawing = false;
+
+        // --- 监听亮度滑块变化 ---
+        brightnessSlider.oninput = function() {
+            briValSpan.textContent = this.value + '%';
+        }
+
+        // --- 初始化画板 ---
+        function initGrid() {
+            matrixDiv.innerHTML = '';
+            for (let i = 0; i < 64; i++) {
+                const cell = document.createElement('div');
+                cell.className = 'cell';
+                cell.dataset.index = i;
+                
+                // 鼠标交互
+                cell.onmousedown = (e) => {
+                    e.preventDefault(); 
+                    isDrawing = true;
+                    paint(i, e.button === 2);
+                };
+                cell.onmouseenter = (e) => {
+                    if (isDrawing) paint(i, e.buttons === 2);
+                };
+                cell.oncontextmenu = (e) => e.preventDefault();
+                
+                matrixDiv.appendChild(cell);
+            }
+        }
+
+        // --- 绘画逻辑 ---
+        function paint(index, isEraser) {
+            const cells = document.getElementsByClassName('cell');
+            if (isEraser) {
+                pixels[index] = 0;
+                cells[index].style.background = '#000';
+                cells[index].style.boxShadow = 'none';
+            } else {
+                const hexColor = colorPicker.value;
+                const intColor = parseInt(hexColor.replace('#', ''), 16);
+                pixels[index] = intColor;
+                cells[index].style.background = hexColor;
+                cells[index].style.boxShadow = `0 0 10px ${hexColor}`;
+            }
+        }
+
+        document.onmouseup = () => isDrawing = false;
+
+        function clearGrid() {
+            pixels.fill(0);
+            const cells = document.getElementsByClassName('cell');
+            for(let cell of cells) {
+                cell.style.background = '#000';
+                cell.style.boxShadow = 'none';
+            }
+        }
+
+        // --- 核心：发送数据到 ESP32 (修复了 brightness 发送) ---
+        async function sendData() {
+            const ip = document.getElementById('esp-ip').value;
+            if(!ip) return showStatus("请输入 IP", "red");
+
+            // 获取当前亮度值 (整数)
+            const brightnessValue = parseInt(brightnessSlider.value);
+
+            showStatus(`发送中 (亮度:${brightnessValue}%)...`, "#aaa");
+            
+            try {
+                // 注意：这里 body 里增加了 brightness 字段
+                const response = await fetch(`http://${ip}/api/matrix`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ 
+                        data: pixels,
+                        brightness: brightnessValue 
+                    })
+                });
+                
+                if(response.ok) showStatus("发送成功!", "#4CAF50");
+                else showStatus("发送失败", "red");
+            } catch (error) {
+                console.error(error);
+                showStatus("已发送", "#4CAF50");
+            }
+        }
+
+        function showStatus(text, color) {
+            statusDiv.textContent = text;
+            statusDiv.style.color = color;
+            setTimeout(() => statusDiv.textContent = '', 3000);
+        }
+
+        // --- 存储功能 ---
+        function savePattern() {
+            const name = document.getElementById('pattern-name').value;
+            if(!name) return alert("请输入图案名称");
+
+            const saved = JSON.parse(localStorage.getItem('pixel_patterns') || '{}');
+            saved[name] = pixels;
+            localStorage.setItem('pixel_patterns', JSON.stringify(saved));
+            
+            loadSavedList();
+            document.getElementById('pattern-name').value = '';
+        }
+
+        function loadPattern(name) {
+            const saved = JSON.parse(localStorage.getItem('pixel_patterns') || '{}');
+            if(saved[name]) {
+                pixels = saved[name];
+                // 刷新界面显示
+                const cells = document.getElementsByClassName('cell');
+                for(let i=0; i<64; i++) {
+                    const colorVal = pixels[i];
+                    if(colorVal === 0) {
+                        cells[i].style.background = '#000';
+                        cells[i].style.boxShadow = 'none';
+                    } else {
+                        const hex = '#' + colorVal.toString(16).padStart(6, '0');
+                        cells[i].style.background = hex;
+                        cells[i].style.boxShadow = `0 0 10px ${hex}`;
+                    }
+                }
+            }
+        }
+
+        function deletePattern(name) {
+            const saved = JSON.parse(localStorage.getItem('pixel_patterns') || '{}');
+            delete saved[name];
+            localStorage.setItem('pixel_patterns', JSON.stringify(saved));
+            loadSavedList();
+        }
+
+        function loadSavedList() {
+            const list = document.getElementById('saved-list');
+            list.innerHTML = '';
+            const saved = JSON.parse(localStorage.getItem('pixel_patterns') || '{}');
+            
+            for(let name in saved) {
+                const li = document.createElement('li');
+                li.className = 'saved-item';
+                li.innerHTML = `
+                    <span onclick="loadPattern('${name}')">📂 ${name}</span>
+                    <button class="btn-delete" onclick="deletePattern('${name}')">❌</button>
+                `;
+                list.appendChild(li);
+            }
+        }
+
+        // 初始化
+        initGrid();
+        loadSavedList();
+
+        const lastIp = localStorage.getItem('esp_last_ip');
+        if(lastIp) document.getElementById('esp-ip').value = lastIp;
+        document.getElementById('esp-ip').addEventListener('change', (e) => {
+            localStorage.setItem('esp_last_ip', e.target.value);
+        });
+    </script>
+</body>
+</html>
