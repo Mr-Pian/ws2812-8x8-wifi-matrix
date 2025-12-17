@@ -1,19 +1,18 @@
-/* ESP32-C3 LED Matrix Web Server (v4.0 - Final)
- * 功能：
- * 1. 开机动画 -> 滚动文字 -> 联网 -> 成功(IP+对勾)/失败(TIMEOUT+红叉)
- * 2. Web端控制：支持 brightness 和 data 数组
+/* ESP32-C3 LED Matrix Web Server (v4.0)
+ * * 核心功能：
+ * 1. 启动流程：开机动画 -> 滚动文字 -> 连接WiFi -> 状态指示(IP/超时)
+ * 2. Web控制：支持亮度调节和像素数组下发
  * 3. 物理按键 (GPIO 10)：
- * - 单击切换 开/关
- * - 关灯时：灯灭，但后台显存保留
- * - 开灯时：恢复关灯前的画面
- * - 解决画面残留问题 (Shadow Buffer Sync)
+ * - 单击开关屏幕
+ * - 关灯模式：仅熄灭LED，显存(Buffer)数据保留
+ * - 开灯模式：从显存恢复之前的画面
  */
 
 #include <stdio.h>
 #include <string.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "freertos/event_groups.h" 
+#include "freertos/event_groups.h"
 #include "esp_system.h"
 #include "esp_wifi.h"
 #include "esp_event.h"
@@ -23,90 +22,94 @@
 #include "cJSON.h"
 #include "led_strip.h"
 #include "driver/gpio.h"
-#include "font8x8.h" 
+#include "font8x8.h"
 #include "math.h"
 
 static const char *TAG = "matrix_main";
 
-// --- 用户配置区域 ---
+// --- 配置参数 ---
 #define WIFI_SSID       "auto_kx_D710"
 #define WIFI_PASS       "31130100"
 #define LED_STRIP_GPIO  3
 #define MATRIX_WIDTH    8
 #define MATRIX_HEIGHT   8
-#define WIFI_TIMEOUT_MS 10000 
-#define GPIO_INPUT_PIN  10    // 你的物理按键引脚
+#define WIFI_TIMEOUT_MS 10000
+#define GPIO_INPUT_PIN  10    // 物理按键
 
-// --- 全局变量与结构体 ---
+// --- 全局变量 ---
 static led_strip_handle_t led_strip;
-static char s_ip_addr_str[16] = "0.0.0.0"; 
+static char s_ip_addr_str[16] = "0.0.0.0";
 
-// 显存像素定义
+// 像素结构
 typedef struct {
     uint8_t r;
     uint8_t g;
     uint8_t b;
 } pixel_color_t;
 
-// 显存副本 (Shadow Buffer)
+// 显存缓冲区 (Shadow Buffer) - 用于关灯时保存状态
 static pixel_color_t s_screen_buffer[64];
 
-// 全局显示开关
+// 屏幕开关状态标志
 volatile bool g_display_enable = false;
 
-// WiFi 连接事件组
+// WiFi事件组
 static EventGroupHandle_t s_wifi_event_group;
 #define WIFI_CONNECTED_BIT BIT0
 
-/* ================== 核心 LED 驱动函数 ================== */
+/* ================== LED 驱动层 ================== */
 
-// 刷新函数：带开关检查
+// 刷新LED：只有在开启状态下才推数据
 void matrix_refresh() {
     if (g_display_enable) {
         led_strip_refresh(led_strip);
     }
 }
 
-// 【关键新增】彻底清空函数：同时清除 显存 和 物理灯珠
+// 彻底清屏：同时清除显存和物理LED状态
 void matrix_clear_all(void)
 {
-    // 1. 物理清空 (如果当前是开着的)
+    // 如果屏幕亮着，先灭物理灯
     if (g_display_enable) {
         led_strip_clear(led_strip);
     }
-    // 2. 显存清空 (防止残留)
+    // 同步清空显存，防止开灯瞬间闪烁旧数据
     memset(s_screen_buffer, 0, sizeof(s_screen_buffer));
 }
 
-// 设置像素：同时写入 显存 和 物理灯珠
+uint32_t pos_to_index(uint8_t x, uint8_t y) {
+    uint32_t index=0;
+
+    // TODO: 根据实际走线（如S型/Z型）计算物理index
+
+    return index;
+}
+
+// 写像素核心函数
 void matrix_set_pixel(uint8_t x, uint8_t y, uint8_t r, uint8_t g, uint8_t b)
 {
     if (x >= MATRIX_WIDTH || y >= MATRIX_HEIGHT) return;
 
-    // 1. 计算物理索引 (蛇形走线处理)
+    // 1. 计算物理位置
     uint32_t index;
-    if (y % 2 == 0) {
-        index = y * MATRIX_WIDTH + x;
-    } else {
-        index = y * MATRIX_WIDTH + (MATRIX_WIDTH - 1 - x);
-    }
+    index = pos_to_index(x, y);
 
-    // 2. 无论开关如何，永远更新显存副本
+    // 2. 始终更新显存 (保证后台数据同步)
     s_screen_buffer[index].r = r;
     s_screen_buffer[index].g = g;
     s_screen_buffer[index].b = b;
 
-    // 3. 只有开灯状态才发送给硬件
+    // 3. 若屏幕开启，同步写入硬件
     if (g_display_enable) {
         led_strip_set_pixel(led_strip, index, r, g, b);
     }
 }
 
-// 辅助函数：根据线性索引点亮
+// 辅助：按线性索引设置像素 (带亮度处理)
 void set_pixel_by_index(int index, int color_val, int brightness_percent) {
     int x = index % 8;
     int y = index / 8;
-    
+
     uint8_t r = (color_val >> 16) & 0xFF;
     uint8_t g = (color_val >> 8) & 0xFF;
     uint8_t b = color_val & 0xFF;
@@ -118,27 +121,28 @@ void set_pixel_by_index(int index, int color_val, int brightness_percent) {
     g = (g * brightness_percent) / 100;
     b = (b * brightness_percent) / 100;
 
-    matrix_set_pixel(7-x, y, r, g, b); 
+    // 注意：这里做了x轴翻转处理 (7-x)，视具体硬件摆放调整
+    matrix_set_pixel(7-x, y, r, g, b);
 }
 
-/* ================== 图形与动画 ================== */
+/* ================== 绘图与动画 ================== */
 
 void scroll_text(const char *text, int speed_ms, uint8_t r, uint8_t g, uint8_t b)
 {
     int len = strlen(text);
-    int total_columns = len * 8 + 8; 
+    int total_columns = len * 8 + 8;
 
     for (int offset = 0; offset < total_columns; offset++) {
-        // 【重要】每一帧都彻底清空显存，防止文字拖影
+        // 帧清空，防止残影
         matrix_clear_all();
 
         for (int x = 0; x < 8; x++) {
-            int current_msg_col = offset + x - 8; 
+            int current_msg_col = offset + x - 8;
 
             if (current_msg_col >= 0 && current_msg_col < len * 8) {
                 int char_idx = current_msg_col / 8;
                 int col_in_char = current_msg_col % 8;
-                
+
                 int char_code = (int)text[char_idx];
                 if (char_code < 0 || char_code > 127) char_code = '?';
 
@@ -162,9 +166,10 @@ void play_startup_animation(void)
     float center_y = 3.5;
     float max_radius = 6.0;
 
+    // 扩散圆环动画
     for (float r = 0; r < max_radius; r += 0.5) {
-        matrix_clear_all(); // 每一帧动画前清空
-        
+        matrix_clear_all(); // 帧重置
+
         for (int x = 0; x < 8; x++) {
             for (int y = 0; y < 8; y++) {
                 float dx = x - center_x;
@@ -172,23 +177,22 @@ void play_startup_animation(void)
                 float dist = sqrt(dx*dx + dy*dy);
 
                 if (dist <= r) {
-                    int brightness = 15; 
-                    uint8_t red = (dist < 1.5) ? 100 : 0;   
-                    uint8_t green = 255 - (dist * 30);      
-                    if (green > 255) green = 0;             
-                    uint8_t blue = 200;                     
+                    int brightness = 15;
+                    uint8_t red = (dist < 1.5) ? 100 : 0;
+                    uint8_t green = 255 - (dist * 30);
+                    if (green > 255) green = 0;
+                    uint8_t blue = 200;
 
                     matrix_set_pixel(x, y, (red * brightness)/100, (green * brightness)/100, (blue * brightness)/100);
                 }
             }
         }
         matrix_refresh();
-        vTaskDelay(pdMS_TO_TICKS(80)); 
+        vTaskDelay(pdMS_TO_TICKS(80));
     }
 
-    // 闪一下白光
+    // 闪白光特效
     for(int i=0; i<64; i++) {
-        // 直接操作 led_strip 的 API 来做全屏白光也可以，但为了更新 buffer，建议用 matrix_set_pixel
         int x = i % 8; int y = i / 8;
         matrix_set_pixel(x, y, 30, 30, 30);
     }
@@ -202,20 +206,19 @@ void play_startup_animation(void)
 
 void draw_success_icon(void)
 {
-    // 【重要】先彻底清空，擦除之前的文字或动画残留
-    matrix_clear_all();
+    matrix_clear_all(); // 清除之前的文字残留
 
     uint8_t R = 0, G = 15, B = 0;
 
-    // 画圆圈
+    // 绘制外框
     for(int x=2; x<=5; x++) { matrix_set_pixel(x, 0, R, G, B); matrix_set_pixel(x, 7, R, G, B); }
     for(int y=2; y<=5; y++) { matrix_set_pixel(0, y, R, G, B); matrix_set_pixel(7, y, R, G, B); }
     matrix_set_pixel(1, 1, R, G, B); matrix_set_pixel(6, 1, R, G, B);
     matrix_set_pixel(1, 6, R, G, B); matrix_set_pixel(6, 6, R, G, B);
 
-    // 画对勾
+    // 绘制对勾
     uint8_t G_tick = 30;
-    matrix_set_pixel(7-2, 4, 0, G_tick, 0); 
+    matrix_set_pixel(7-2, 4, 0, G_tick, 0);
     matrix_set_pixel(7-3, 5, 0, G_tick, 0);
     matrix_set_pixel(7-4, 4, 0, G_tick, 0);
     matrix_set_pixel(7-5, 3, 0, G_tick, 0);
@@ -225,9 +228,8 @@ void draw_success_icon(void)
 
 void draw_failure_icon(void)
 {
-    // 【重要】先彻底清空
     matrix_clear_all();
-    
+
     uint8_t R = 20, G = 0, B = 0;
 
     // 外框
@@ -236,10 +238,10 @@ void draw_failure_icon(void)
     matrix_set_pixel(1, 1, R, G, B); matrix_set_pixel(6, 1, R, G, B);
     matrix_set_pixel(1, 6, R, G, B); matrix_set_pixel(6, 6, R, G, B);
 
-    // 内部叉
+    // 叉号
     for (int i = 2; i <= 5; i++) {
-        matrix_set_pixel(i, i, R, G, B);     
-        matrix_set_pixel(i, 7-i, R, G, B);   
+        matrix_set_pixel(i, i, R, G, B);
+        matrix_set_pixel(i, 7-i, R, G, B);
     }
 
     matrix_refresh();
@@ -251,22 +253,21 @@ static void configure_led(void)
 {
     led_strip_config_t strip_config = {
         .strip_gpio_num = LED_STRIP_GPIO,
-        .max_leds = 64, 
+        .max_leds = 64,
         .led_model = LED_MODEL_WS2812,
         .flags.invert_out = false,
     };
     led_strip_rmt_config_t rmt_config = {
-        .resolution_hz = 10 * 1000 * 1000, 
+        .resolution_hz = 10 * 1000 * 1000,
         .flags.with_dma = false,
     };
     ESP_ERROR_CHECK(led_strip_new_rmt_device(&strip_config, &rmt_config, &led_strip));
-    
-    // 初始化时清空显存
+
     matrix_clear_all();
     matrix_refresh();
 }
 
-/* ================== 任务：物理按键监控 ================== */
+/* ================== 按键监控任务 ================== */
 
 void turn_on_and_off_led(void *pvParameters)
 {
@@ -274,43 +275,42 @@ void turn_on_and_off_led(void *pvParameters)
     io_conf.intr_type = GPIO_INTR_DISABLE;
     io_conf.pin_bit_mask = (1ULL << GPIO_INPUT_PIN);
     io_conf.mode = GPIO_MODE_INPUT;
-    // 使用内部上拉：平时高电平(1)，按下低电平(0)
-    io_conf.pull_up_en = 1;   
-    io_conf.pull_down_en = 0; 
+    // 启用内部上拉，低电平触发
+    io_conf.pull_up_en = 1;
+    io_conf.pull_down_en = 0;
     gpio_config(&io_conf);
 
     ESP_LOGI(TAG, "Button Monitor Task Started");
 
     while (1) {
-        // 检测按下 (低电平)
         if (gpio_get_level(GPIO_INPUT_PIN) == 0) {
-            
-            // 1. 去抖动
+
+            // 简单消抖
             vTaskDelay(pdMS_TO_TICKS(50));
             if (gpio_get_level(GPIO_INPUT_PIN) == 0) {
-                
-                // 2. 切换状态
+
+                // 翻转显示状态
                 g_display_enable = !g_display_enable;
 
                 if (g_display_enable) {
-                    // --> 开灯逻辑：从显存恢复
+                    // 开灯：将Shadow Buffer的数据刷回灯珠
                     ESP_LOGI(TAG, "Display ON: Restoring buffer...");
                     for (int i = 0; i < 64; i++) {
-                        led_strip_set_pixel(led_strip, i, 
-                                            s_screen_buffer[i].r, 
-                                            s_screen_buffer[i].g, 
+                        led_strip_set_pixel(led_strip, i,
+                                            s_screen_buffer[i].r,
+                                            s_screen_buffer[i].g,
                                             s_screen_buffer[i].b);
                     }
                     led_strip_refresh(led_strip);
-                } 
+                }
                 else {
-                    // --> 关灯逻辑：清空物理灯珠 (保留显存)
+                    // 关灯：仅清空物理灯珠，不清除Buffer
                     ESP_LOGI(TAG, "Display OFF: Saving power...");
                     led_strip_clear(led_strip);
                     led_strip_refresh(led_strip);
                 }
 
-                // 3. 等待按键松开 (防止连击)
+                // 等待释放
                 while (gpio_get_level(GPIO_INPUT_PIN) == 0) {
                     vTaskDelay(pdMS_TO_TICKS(50));
                 }
@@ -338,11 +338,11 @@ static esp_err_t matrix_post_handler(httpd_req_t *req)
     size_t recv_size = MIN(req->content_len, sizeof(content));
 
     int ret = httpd_req_recv(req, content, recv_size);
-    if (ret <= 0) {  
+    if (ret <= 0) {
         if (ret == HTTPD_SOCK_ERR_TIMEOUT) httpd_resp_send_408(req);
         return ESP_FAIL;
     }
-    content[ret] = '\0'; 
+    content[ret] = '\0';
 
     cJSON *root = cJSON_Parse(content);
     if (root) {
@@ -352,8 +352,8 @@ static esp_err_t matrix_post_handler(httpd_req_t *req)
 
         cJSON *data_array = cJSON_GetObjectItem(root, "data");
         if (cJSON_IsArray(data_array)) {
-            
-            // 【重要】收到新图时，先清空显存，防止和旧图叠加
+
+            // 收到新画面前先清屏，避免叠加
             matrix_clear_all();
 
             int array_size = cJSON_GetArraySize(data_array);
@@ -373,7 +373,7 @@ static esp_err_t matrix_post_handler(httpd_req_t *req)
 static httpd_handle_t start_webserver(void)
 {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
-    config.max_open_sockets = 5; 
+    config.max_open_sockets = 5;
     config.lru_purge_enable = true;
 
     httpd_handle_t server = NULL;
@@ -390,7 +390,7 @@ static httpd_handle_t start_webserver(void)
 /* ================== WiFi Logic ================== */
 
 static void wifi_event_handler(void* arg, esp_event_base_t event_base,
-                                int32_t event_id, void* event_data)
+                               int32_t event_id, void* event_data)
 {
     if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
         esp_wifi_connect();
@@ -408,7 +408,7 @@ static void wifi_event_handler(void* arg, esp_event_base_t event_base,
 
 void wifi_init_sta(void)
 {
-    s_wifi_event_group = xEventGroupCreate(); 
+    s_wifi_event_group = xEventGroupCreate();
     esp_netif_init();
     esp_event_loop_create_default();
     esp_netif_create_default_wifi_sta();
@@ -428,7 +428,7 @@ void wifi_init_sta(void)
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
     ESP_ERROR_CHECK(esp_wifi_start());
     esp_wifi_set_ps(WIFI_PS_NONE);
-    esp_wifi_set_max_tx_power(52); 
+    esp_wifi_set_max_tx_power(52);
 }
 
 /* ================== Main ================== */
@@ -442,26 +442,26 @@ void app_main(void)
     }
     ESP_ERROR_CHECK(ret);
 
-    // 1. 初始化灯珠 (此时 buffer 全0)
+    // 1. 硬件初始化 (Buffer置0)
     configure_led();
 
-    // 2. 启动按键监控任务
+    // 2. 启动按键扫描任务
     xTaskCreate(turn_on_and_off_led, "btn_task", 2048, NULL, 5, NULL);
 
     // 3. 播放开机动画
     ESP_LOGI(TAG, "Startup Animation...");
-    play_startup_animation(); 
+    play_startup_animation();
 
     scroll_text("Center4Maker by Mao", 60, 15, 15, 15);
 
-    // 4. 开始连 WiFi
+    // 4. WiFi连接
     ESP_LOGI(TAG, "Connecting WiFi...");
-    wifi_init_sta(); 
+    wifi_init_sta();
 
-    // 5. 等待连接动画
+    // 5. 等待连接 (带超时动画)
     int frame = 0;
     bool is_connected = false;
-    int max_frames = WIFI_TIMEOUT_MS / 50; 
+    int max_frames = WIFI_TIMEOUT_MS / 50;
 
     while (frame < max_frames) {
         EventBits_t bits = xEventGroupGetBits(s_wifi_event_group);
@@ -470,57 +470,54 @@ void app_main(void)
             break;
         }
 
-        // 连接中... 呼吸灯
-        matrix_clear_all(); // 清空显存
-        int brightness = (frame % 40); 
-        if (brightness > 20) brightness = 40 - brightness; 
-        
+        // 连接过程中的呼吸灯效果
+        matrix_clear_all();
+        int brightness = (frame % 40);
+        if (brightness > 20) brightness = 40 - brightness;
+
         // 中心黄色呼吸
-        matrix_set_pixel(3, 3, brightness, brightness, 0); 
+        matrix_set_pixel(3, 3, brightness, brightness, 0);
         matrix_set_pixel(3, 4, brightness, brightness, 0);
         matrix_set_pixel(4, 3, brightness, brightness, 0);
         matrix_set_pixel(4, 4, brightness, brightness, 0);
-        
+
         matrix_refresh();
         vTaskDelay(pdMS_TO_TICKS(50));
         frame++;
     }
 
-    // 6. 结果判定分支
+    // 6. 结果判定
     if (is_connected) {
         ESP_LOGI(TAG, "WiFi Connected!");
-        
-        // 瞬间绿屏提示
+
+        // 绿屏提示
         matrix_clear_all();
         for(int i=0; i<64; i++) {
-             // 简易写法：直接填满绿色
-             int x=i%8, y=i/8;
-             matrix_set_pixel(x,y, 0, 10, 0);
+            int x=i%8, y=i/8;
+            matrix_set_pixel(x,y, 0, 10, 0);
         }
         matrix_refresh();
         vTaskDelay(pdMS_TO_TICKS(700));
-        
-        // 滚动显示 IP
+
+        // 滚动IP地址
         scroll_text(s_ip_addr_str, 60, 0, 15, 15);
 
-        // 显示常驻对勾
+        // 显示常驻对勾，系统就绪
         ESP_LOGI(TAG, "System Ready.");
-        draw_success_icon(); 
+        draw_success_icon();
 
-        // 死循环保活
         while(1) {
             vTaskDelay(pdMS_TO_TICKS(1000));
         }
 
     } else {
         ESP_LOGE(TAG, "WiFi Connection Timeout!");
-        
+
         scroll_text("TIMEOUT", 100, 20, 0, 0);
         draw_failure_icon();
-        
+
         while(1) {
             vTaskDelay(pdMS_TO_TICKS(5000));
-            // esp_restart(); 
         }
     }
 }
