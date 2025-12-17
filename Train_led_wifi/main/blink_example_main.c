@@ -506,18 +506,13 @@ void app_main(void)
         ESP_LOGI(TAG, "System Ready.");
         draw_success_icon();
 
-        while(1) {
-            vTaskDelay(pdMS_TO_TICKS(1000));
-        }
-
+        return;
     } else {
         ESP_LOGE(TAG, "WiFi Connection Timeout!");
 
         scroll_text("TIMEOUT", 100, 20, 0, 0);
         draw_failure_icon();
 
-        while(1) {
-            vTaskDelay(pdMS_TO_TICKS(5000));
-        }
+        return;
     }
 }
