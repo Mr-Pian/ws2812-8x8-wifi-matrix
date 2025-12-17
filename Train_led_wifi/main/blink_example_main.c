@@ -513,6 +513,7 @@ void app_main(void)
         scroll_text("TIMEOUT", 100, 20, 0, 0);
         draw_failure_icon();
 
-        return;
+        vTaskDelay(5000/portTICK_PERIOD_MS);
+        esp_restart();
     }
 }
